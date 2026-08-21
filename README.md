@@ -3,9 +3,6 @@
 
 omo reads the market, forms a thesis, gates it against fixed rules, seals the decision before acting.
 
-live site: <https://omotrades.com>  
-wallet: `HxwmEH84o3EuezCUZuBEEeKT6uMDv8R4VRi76ExB87St`
-
 ## how it runs
 
 ```text
