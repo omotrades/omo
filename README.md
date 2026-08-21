@@ -29,9 +29,8 @@ the whole sequence is joined in `src/lib/pipeline.server.ts`.
 
 - **wallet** — `HxwmEH84o3EuezCUZuBEEeKT6uMDv8R4VRi76ExB87St` on Solana
 - **commitments** — Solana Memo Program transactions from the burner memo key
-- **prices** — Jupiter / DexScreener public APIs
 
-any claim on the front end can be recomputed from those three public sources.
+any claim on the front end can be recomputed from those public sources.
 
 ## public endpoints
 
