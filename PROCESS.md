@@ -110,6 +110,40 @@ Guards, because an autonomous loop holding a key needs them:
 - per-order ceiling ($3,000) and rolling 24h notional ceiling ($12,000),
 - a SOL reserve is never spent, so the wallet can always pay fees.
 
+## 5b. manage (the exit loop)
+
+`src/lib/exit.server.ts`
+
+An entry loop on its own can only open risk. Every cycle, before anything new is
+considered, every open position is re-read from the wallet, re-priced from public
+dex data, and run through a fixed exit rule set:
+
+| rule | fires when |
+| --- | --- |
+| `exit_stop_loss` | unrealised is at or below -35% of cost |
+| `exit_trailing_stop` | position printed +60% or better and has given back 40 points from that high |
+| `exit_liquidity_break` | pool below $8,000, so the size can no longer leave cleanly |
+| `exit_thesis_invalidated` | 6h change at or below -25% **and** sells leading buys by 1.4x |
+| `exit_take_profit` | +100% / +300% / +900%, trimming 33% / 33% / 50% of what remains |
+| `exit_stale_thesis` | held 14 days, inside +/-10%, 6h volume under $5,000 |
+
+Risk-off rules beat profit taking: if a stop, trail, liquidity break,
+invalidation or stale timer fires, the position closes fully instead of trimming.
+
+A **separate sell risk gate** then runs, narrow on purpose, because a refused buy
+costs nothing while a refused sell leaves risk on: minimum $25 clip, 30 minute
+cooldown per mint, a tranche can only be taken once, and a ceiling of 8 exits per
+rolling 24 hours.
+
+The trailing stop needs a memory, so the high-water mark and tranche counter are
+stored in the publicly readable `omo_position_marks` table. A trailing stop
+nobody can inspect is a story, not a rule.
+
+The exit is then hashed, published as a memo and only then routed and signed, so a
+sell carries the same proof as a buy and passes the same four checks in
+`/api/public/verify.json`. `GET /api/public/exits.json` publishes the thresholds,
+the stored marks and every sell bound to the commitment that preceded it.
+
 ## 6. journal
 
 `src/lib/wallet.server.ts`

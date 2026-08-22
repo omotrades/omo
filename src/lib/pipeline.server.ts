@@ -5,6 +5,10 @@
  * pieces live in their own modules; this is the spine that joins them so the
  * order of operations is legible instead of inferred:
  *
+ *   manage    every open position is re-priced and run through the exit rule
+ *             set first: invalidation, hard stop, trailing give-back, profit
+ *             tranches, stale thesis. an exit is sealed and published before it
+ *             executes, exactly like an entry, and passes a separate sell gate.
  *   read      scan solana memecoins from public dex data, read the fomo board
  *             and the thesis text a name is carrying, search the open web for
  *             what is actually driving attention.
@@ -34,7 +38,7 @@ import type { AuditRule } from "./audit.server";
 import { MAX_ORDER_USD, type OrderResult } from "./execute.server";
 
 export type CycleStep = {
-  step: "read" | "think" | "gate" | "seal" | "execute" | "journal" | "reveal";
+  step: "read" | "think" | "gate" | "seal" | "execute" | "journal" | "reveal" | "manage";
   ok: boolean;
   detail: string;
 };
@@ -50,8 +54,11 @@ export type CycleOutcome = {
   commitHash: string | null;
   memoSignature: string | null;
   order: OrderResult | null;
+  /** one entry per open position the exit loop looked at and acted on */
+  exits: import("./exit.server").ExitOutcome[];
   steps: CycleStep[];
 };
+
 
 /**
  * Crowd heat, 0..100, read off how much written conviction a name is carrying on
@@ -83,8 +90,30 @@ export async function runDecisionCycle(options: { rotation?: number; onBreak?: b
     commitHash: null,
     memoSignature: null,
     order: null,
+    exits: [],
     steps,
   };
+
+  // ---- manage (exit loop) -----------------------------------------------
+  // risk comes off before new risk goes on, so position management runs first.
+  // every exit it takes is sealed, published and journalled the same way an
+  // entry is, which is why a sell is verifiable with the same four checks.
+  const { runExitCycle } = await import("./exit.server");
+  const exits = await runExitCycle().catch((error) => {
+    steps.push({ step: "manage", ok: false, detail: `exit loop failed: ${(error as Error).message}` });
+    return [] as import("./exit.server").ExitOutcome[];
+  });
+  outcome.exits = exits;
+  const acted = exits.filter((row) => row.order?.status === "filled");
+  steps.push({
+    step: "manage",
+    ok: true,
+    detail: acted.length
+      ? acted.map((row) => `${row.symbol}: ${row.decision.reason} (${row.order && "signature" in row.order ? row.order.signature : ""})`).join("; ")
+      : exits.length
+        ? exits.map((row) => `${row.symbol}: ${row.decision.reason}`).join("; ")
+        : "every open position still inside its rules, nothing to close",
+  });
 
   // ---- read -------------------------------------------------------------
   const { scanMemecoins, researchToken, describeResearch, describeCandidate } = await import(

@@ -23,10 +23,13 @@ These are enforced in code and should never be relaxed:
 3. `OMO_COMMIT_KEY` is memo-only and holds no book. Compromise costs fees, not funds.
 4. An order must match an already-confirmed, sealed commitment on mint and side.
 5. One order per commitment. Per-order and rolling 24h notional ceilings apply.
-6. A SOL reserve is never spent so the wallet can always pay fees.
-7. `src/routes/api/public/*` bypasses site auth by design, so every handler there
+6. Sells run their own risk gate: a minimum clip, a per-mint cooldown, one exit per
+   profit tranche and a rolling 24h exit-count ceiling. Rule thresholds are code, never
+   model output.
+7. A SOL reserve is never spent so the wallet can always pay fees.
+8. `src/routes/api/public/*` bypasses site auth by design, so every handler there
    authenticates or authorises its own caller.
-8. Failing verification checks are published, never suppressed.
+9. Failing verification checks are published, never suppressed.
 
 ## Out of scope
 

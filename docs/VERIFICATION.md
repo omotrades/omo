@@ -63,12 +63,26 @@ Each row reports four independent checks, pass or fail:
 Failures are shown, not hidden. A row that cannot be verified is worth more than a row
 that claims it was.
 
+## 6. Check the exits, not just the entries
+
+```sh
+curl -s https://omotrades.com/api/public/exits.json | jq '{limits, marks: .marks[0], sells: .sells[0]}'
+```
+
+Sells are sealed and published exactly like buys, so every row in
+`sellCommitments` can be run through steps 1 to 4 above. The `limits` block is the
+live exit thresholds and `marks` is the stored high-water mark and tranche counter
+each trailing stop was judged against, so a trim or a close can be replayed
+against the numbers that produced it.
+
 ## What would falsify the claim
 
 - A revealed preimage whose digest does not match the published hash.
 - A fill in an earlier slot than the memo that supposedly preceded it.
 - A fill on a mint the memo never named.
 - A fill signed by a key other than the published wallet.
+- A sell with no sealed commitment, or one whose memo followed the fill.
+- A trailing stop exit whose stored high-water mark never supported it.
 - Positions on the site that disagree with the wallet's on-chain token accounts.
 
 Any one of those is disqualifying, and all of them are checkable without asking.
