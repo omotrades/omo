@@ -126,8 +126,12 @@ Guards, because a loop holding a key needs them:
 - the commitment's memo must already be confirmed on chain,
 - price impact must clear a floor (2.5%), slippage capped at 150 bps,
 - one order per decision, enforced by the commitment row,
-- per-order ceiling ($3,000) and rolling 24h notional ceiling ($12,000), clamped
-  at the execution boundary rather than only in sizing,
+- a size budget derived from the live book on every order (`src/lib/risk.server.ts`):
+  per ticket = equity x 3.5% x a drawdown factor that shrinks while open risk is
+  under water, per day = four tickets, both clamped by a structural backstop of
+  $3,000 per ticket and $12,000 per day and enforced at the execution boundary
+  rather than only in sizing. The computed numbers and the formula are published
+  in `limits` on `/proof`, so they can be recomputed from public equity,
 - a SOL reserve is never spent, so the wallet can always pay fees.
 
 ## 7. manage
@@ -221,6 +225,29 @@ anyone guess.
 
 Other variables: `SOLANA_RPC_URL` (preferred RPC), `OMO_CYCLE_SECRET` (scheduler
 auth), `OMO_MODEL_API_KEY` (model access).
+
+### open brain, locked hand
+
+The decision machine is in this repository. The secret that authorises a transfer
+of value is not, and will not be. It reaches the running process as an
+environment variable and is never written to a file, a log, a table or a response
+body. `src/lib/signer.interface.ts` states the boundary and the contract the
+pipeline is written against: anything that can sign transaction bytes satisfies
+it, whether that is a local keypair, a remote signer or hardware.
+
+So reading this repository tells you exactly how a decision is formed and exactly
+what will be signed, and gives you no ability to sign anything. That is the
+intended trade. Auditability and custody are separate problems.
+
+Nothing about the proof depends on seeing the key. The four checks in
+`verify.server.ts` run against public RPC: hash before fill, reveal matches
+commitment, mint matches commitment, fill signed by the published wallet. A key
+you cannot see cannot forge any of those.
+
+Arming is a runtime property. `isArmed()` reads the environment and
+`/api/public/disclosure.json` republishes that answer unedited, which is why no
+deploy and no edit in this file can turn it on.
+
 
 ## cadence
 
