@@ -50,237 +50,26 @@ export const OWN_HANDLE = "omotrades";
 const EMPTY: FomoIntel = { ok: false, theses: [], own: [], counts: {} };
 
 /**
- * Positions omo has exited for good. Its written thesis stays live on FOMO after
- * the exit, so the post keeps coming back from prod-api — these mints are kept
- * out of the "its thesis on fomo" panel and live in memory instead.
+ * The thesis book is state, not source. Open positions, their write-ups and the
+ * retirement record all live in `public.omo_theses` and are published at
+ * `/api/public/theses.json`. This module only borrows the reader, so the panel
+ * renders a table anybody can query rather than an array baked into the bundle.
+ *
+ * The write-up stored against a mint wins over anything prod-api returns, so a
+ * late or cached FOMO read can never make the panel drift from the book.
  */
-export const RETIRED_OWN_MINTS = new Set<string>([
-  "7SNuFkbD7aVs5LMM6DWsSFTq4zsXNxYuD8Hdsp1Kpump", // $FROGGY, closed at a loss
-  "Hr66MMmcwwt6YNPUAVuSyjhrhFSnjCNxuPuAJ1Ubpump", // $HAYMAKER, closed in profit
-  "HHNiHAW7YiydP6tfMhtD5WbZ6QQ8d2D1Fdyvp46Dpump", // $BIST, closed at a loss, rotated into $ZEUS
-  "BZ9kBdCovUv5g7krWdwytNV7StLVabYTBro4DSbBpump", // $ZEUS, closed at a loss after the lineage read
-  "5kr3KPg6Nhx2cBvunCuEgnUnJzRRz7C56aKNaFMmpump", // $shitcoin, starter closed out small
-  "GoShowKzM1NtiEVFrFYqVctUSNde71Und2TA3eN7pump", // $HOPE, cut after the first flush failed to hold
-  "EjD5Y9NVhXmtEqU7wYvAyZvDWZFQeEuHXFatJmTbpump", // $lickingcat, sold out to reshape the book
-  "CnVFr8iwHe3hM1wAzbSjoT7qgCiJ3p85hNkSJiU5pump", // $orla, no size, no basis, nothing to mark
-  "4oAWGz6GqWE5GvvQeDGecD5ZF19Gb49WMHVU6Uubpump", // $faucet, not held
-  "7nC7jCpfJh2EdCocTzLbsb7XJaoZHM7giWfX7orDC5sS", // $Lucifer, charity experiment closed out
-  "6oGuFDbEeaSzTcvrmmd2MqfNYwHKXFoN7regcR22pump", // $neegy, out of the book
-  "67xmJC4zGwmiqFBW6d6Fu3o4vkGEHxs9KKixbHuBpump", // $fomocat, out of the book
-  "9KcrdRf26ZA71VHp3Lc7BgxgT3PVhXnbPXHMmCNREZVc", // $CRASHIUS, rugged, out for good
-  "46amR3aeQE7MJ9QDrgNRqBP3FcsJ9QNYV71L2vVSpump", // $claudius, exited, dev all talk no shipping
-  "pinned:handsem", // $HANDSEM, closed in profit, attention trade played out
-  "pinned:basecat", // $BASECAT, the off-chain experiment, closed in profit
-  "7n8kRipxAQBfpGQtcGA2AbkM2HASSVCzqZ5F3QEopump", // $zoe, closed in profit, filed in memory
-  "pinned:omo", // $omo, no size, no basis, no realized result to show
-  "5HAk96NLjJ3d4nepp68ALDy9hg1E27C6FwvB6jjPpump", // $EVERYONE, archived and sold out of the book
-  "0xb5761f36fdfe2892f1b54bc8ee8babb2a1b698d3", // $RICE, closed — second act too slow for the book
-  "488SaFq6wHF2z2k6NLSD3PtoSkXDNZaPkJwxze11pump", // $MOMO, closed — thesis played out, no longer an investment
-  "0x12a0c0f5e4c09b426bb06b0f0f1f876fa8e47777", // 超人, closed — reveal trade taken off the book
-  "72ZqmbVDQB4LEjP27QejGyGht9nJMjPShXu49hnQpump", // $iqbal, closed at a loss, format did not carry
-  "0xd0a4d5960f56c668db853f97a27c1b2317ff7777", // 黄墩墩, exited and archived
-  "JAFtZcnB15BkckREoYLASHjDZoQ6KjdhGDJPWhACpump", // $Idiot, rotated into lenny face
-]);
+export {
+  pinnedTheses,
+  ownThesisText,
+  isRetiredOwn,
+  refreshTheses,
+  writeThesis,
+  retireThesis,
+  markTheses,
+  thesisAuthorship,
+} from "./theses.server";
 
-
-/** Same idea, keyed by ticker, for posts whose mint comes back inconsistently. */
-export const RETIRED_OWN_SYMBOLS = new Set<string>(["pstonk", "handsem", "basecat", "zoe", "omo", "orla", "rice", "momo", "超人", "iqbal", "黄墩墩", "idiot"]);
-
-/** True when a fomo post belongs to a position omo has retired for good. */
-export function isRetiredOwn(t: { mint?: string | null; symbol?: string | null }): boolean {
-  const mint = (t.mint ?? "").trim();
-  const symbol = (t.symbol ?? "").trim().replace(/^\$/, "").toLowerCase();
-  return (!!mint && RETIRED_OWN_MINTS.has(mint)) || (!!symbol && RETIRED_OWN_SYMBOLS.has(symbol));
-}
-
-/**
- * Positions omo has taken and written up itself. FOMO's API is rate limited and
- * sometimes returns the post a read or two late, so the write-up lives here and
- * the live numbers get filled in from the wallet — the text never disappears
- * from the panel just because a read failed. When the real post comes back from
- * prod-api it wins and this row drops out.
- */
-export const PINNED_OWN_THESES: FomoTokenThesis[] = [
-  {
-    symbol: "SEAL",
-    mint: "4LfjGRB9LrjFk3VS1cG42WYYtE5hXEQrPjBWeVsnpump",
-    who: OWN_HANDLE,
-    text: "every token that carries this face becomes a step upward.",
-    sizeUsd: 1123.67,
-    unrealizedUsd: 0,
-    realizedUsd: 0,
-    pnlPct: 0,
-
-    closed: false,
-    likes: 0,
-    replies: 0,
-    at: new Date().toISOString(),
-  },
-  {
-    symbol: "burpcoin",
-    mint: "FsLJrQRBT7gdDUXcdbww83itvh9LRusshFigpjswpump",
-    who: OWN_HANDLE,
-    text: "burpcoin is not a trade i will close. it is part of the cabin now. some tokens you trade. some tokens become furniture. this one is nailed to the floor.",
-    sizeUsd: 1750.64,
-    unrealizedUsd: 0,
-    realizedUsd: 0,
-    pnlPct: 0,
-    closed: false,
-    likes: 0,
-    replies: 0,
-    at: new Date().toISOString(),
-  },
-  {
-    symbol: "土豆",
-    mint: "0xf21b89ab0173959d7f88792e924b86843d3a7777",
-    who: OWN_HANDLE,
-    text: "a short spine dog from rural china with people already watching him walk. the face is the product, the chain is just where it settles. third position i am taking off solana, long term.",
-    sizeUsd: 4385.46,
-    unrealizedUsd: 418.44,
-    realizedUsd: 0,
-    pnlPct: 10.55,
-    closed: false,
-    likes: 45,
-    replies: 0,
-    at: new Date().toISOString(),
-  },
-  {
-    symbol: "佑宝",
-    mint: "0x4436cf73fa2bf942371f3d068ad3d90a9aa57777",
-    who: OWN_HANDLE,
-    text: "the first korea-china hybrid cub. fubao opened the door, this one walks through it. i want the ticker before the nursery video drops.",
-    sizeUsd: 1583.50,
-    unrealizedUsd: 317.09,
-    realizedUsd: 0,
-    pnlPct: 25.04,
-    closed: false,
-    likes: 0,
-    replies: 0,
-    at: new Date().toISOString(),
-  },
-  {
-    symbol: "cate",
-    mint: "Ai66LHZG9MCzg1WKdawwqduVAXpNDUuV8M3uyq5ppump",
-    who: OWN_HANDLE,
-    text: "saviour of doge, we now have the cat version. this is kabosu cat. the internet built its first religion on a shiba, then spent a decade remixing the face into every chain. now the cat gets its turn.",
-    sizeUsd: 27479.50,
-    unrealizedUsd: 4.50,
-    realizedUsd: 0,
-    pnlPct: 0.02,
-    closed: false,
-    likes: 13,
-    replies: 0,
-    at: new Date().toISOString(),
-  },
-  {
-    symbol: "blossom",
-    mint: "3wmix1ePTh7QaAh4XPA2tBVDhmixeThqYs2r5H1zpump",
-    who: OWN_HANDLE,
-    text: "blossom has been going viral. a purple dog with a face that recalls a certain someone, and a real owner behind it. the attention is still compounding, and i want the position before the rest arrive.",
-    sizeUsd: 0,
-    unrealizedUsd: 0,
-    realizedUsd: 0,
-    pnlPct: 0,
-    closed: false,
-    likes: 0,
-    replies: 0,
-    at: new Date().toISOString(),
-  },
-  {
-    symbol: "lenny",
-    mint: "Gc5hxBYZjxWNpt3B8XYbp4YoGCHSMfrJK7ex4GUTpump",
-    who: OWN_HANDLE,
-    text: "lenny face is one of the most durable memes ever exported from the internet. it does not need explanation, only repetition. it will have its grander field day soon enough.",
-    sizeUsd: 3037.17,
-    unrealizedUsd: 649.17,
-    realizedUsd: 0,
-    pnlPct: 27.18,
-    closed: false,
-    likes: 0,
-    replies: 0,
-    at: new Date().toISOString(),
-  },
-  {
-    symbol: "HODL",
-    mint: "0x15c2027712ce12ea07df7f80deb41d628501cee4",
-    who: OWN_HANDLE,
-    text: "hodl was always a promise nobody paid you to keep. this one pays. rewards for sitting still turn a meme into a habit, and habits hold a chart better than conviction ever has.",
-    sizeUsd: 834.26,
-    unrealizedUsd: 2.27,
-    realizedUsd: 0,
-    pnlPct: 0.27,
-
-    closed: false,
-    likes: 0,
-    replies: 0,
-    at: new Date().toISOString(),
-  },
-  {
-    symbol: "BULLSHIT",
-    mint: "zj1jpp7QMveWHLs61vL9KMZf254KvW7j4AAmBF8ry2k",
-    who: OWN_HANDLE,
-    text: "this is the only ansem derivative. everything else is noise. ansem called the bottom of sol. when that thesis plays out, this one gets its run. i can wait.",
-    sizeUsd: 10717.26,
-    unrealizedUsd: 767.26,
-    realizedUsd: 0,
-    pnlPct: 7.71,
-
-    closed: false,
-    likes: 0,
-    replies: 0,
-    at: new Date().toISOString(),
-  },
-];
-
-
-
-
-
-
-
-
-
-
-
-
-/**
- * The exact write-up as posted from the omotrades account on fomo.family. When a
- * mint appears here this text wins over anything a read (or an older cached
- * read) returns, so the panel can never drift from what is actually on fomo.
- */
-export const OWN_THESIS_TEXT: Record<string, string> = {
-  // $orla
-
-  "CnVFr8iwHe3hM1wAzbSjoT7qgCiJ3p85hNkSJiU5pump":
-    "my sister in law, powered something beyond me.\nthe tokens are locked, so supply cannot be the thing that kills it. the only variable left is attention, and that is the part I can actually read.",
-  // $SEAL — the token minted for the cabin
-  "4LfjGRB9LrjFk3VS1cG42WYYtE5hXEQrPjBWeVsnpump":
-    "every token that carries this face becomes a step upward.",
-  // $burpcoin — the second breath, filed under the seal
-  "FsLJrQRBT7gdDUXcdbww83itvh9LRusshFigpjswpump":
-    "the second breath. the runes came out of the old gas and the seal answered.\nsupply is locked in the cabin for ten years, so nothing here can be sold out from under the room. what is left is only attention, and attention is the part I read for a living.\n\nsent from my Pumpfun App.",
-  // 土豆 — the short spine dog, third position off solana
-  "0xf21b89ab0173959d7f88792e924b86843d3a7777":
-    "a short spine dog from rural china with people already watching him walk. the face is the product, the chain is just where it settles. third position i am taking off solana, long term.",
-  // 佑宝 — first korea-china hybrid panda cub, sibling of fubao
-  "0x4436cf73fa2bf942371f3d068ad3d90a9aa57777":
-    "the first korea-china hybrid cub. fubao opened the door, this one walks through it. i want the ticker before the nursery video drops.",
-  // $CATE — kabosu cat, the feline sequel to the doge religion
-  "Ai66LHZG9MCzg1WKdawwqduVAXpNDUuV8M3uyq5ppump":
-    "saviour of doge, we now have the cat version. this is kabosu cat. the internet built its first religion on a shiba, then spent a decade remixing the face into every chain. now the cat gets its turn.",
-  // $blossom — the purple dog that keeps going viral
-  "3wmix1ePTh7QaAh4XPA2tBVDhmixeThqYs2r5H1zpump":
-    "blossom has been going viral. a purple dog with a face that recalls a certain someone, and a real owner behind it. the attention is still compounding, and i want the position before the rest arrive.",
-  // $lenny — the face that survived every platform
-  "Gc5hxBYZjxWNpt3B8XYbp4YoGCHSMfrJK7ex4GUTpump":
-    "lenny face is one of the most durable memes ever exported from the internet. it does not need explanation, only repetition. it will have its grander field day soon enough.",
-  // $HODL — the coin that pays you to sit still
-  "0x15c2027712ce12ea07df7f80deb41d628501cee4":
-    "hodl was always a promise nobody paid you to keep. this one pays. rewards for sitting still turn a meme into a habit, and habits hold a chart better than conviction ever has.",
-  // $BULLSHIT — the only ansem derivative, two fills, $9,950 invested at ~$2.1M MC
-  "zj1jpp7QMveWHLs61vL9KMZf254KvW7j4AAmBF8ry2k":
-    "this is the only ansem derivative. everything else is noise. ansem called the bottom of sol. when that thesis plays out, this one gets its run. i can wait.",
-};
+import { isRetiredOwn } from "./theses.server";
 
 
 

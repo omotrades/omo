@@ -10,9 +10,11 @@ import {
   describeFomoIntel,
   readFomoIntel,
   readOwnBasis,
-  PINNED_OWN_THESES,
-  OWN_THESIS_TEXT,
+  pinnedTheses,
+  ownThesisText,
   isRetiredOwn,
+  refreshTheses,
+  markTheses,
   type FomoTokenThesis,
 } from "./fomo.server";
 
@@ -32,12 +34,13 @@ import {
 } from "./market.server";
 
 import { runInBackground } from "./background";
-import { lastOffBookMark, readOffBook, type OffBook } from "./offbook.server";
+import { lastOffBookMark, offBookSnapshot, readOffBook, type OffBook } from "./offbook.server";
 
 
 import {
   fetchRecentTrades,
   getWalletSnapshot,
+  isSnapshotSane,
   OMO_WALLET,
   setBasisOverrides,
   type BasisOverride,
@@ -119,6 +122,22 @@ function mergeVerdicts(list: OmoVerdict[]): OmoVerdict[] {
 function rotateVerdicts(fresh: OmoVerdict[], previous: OmoVerdict[]): OmoVerdict[] {
   if (!fresh.length) return mergeVerdicts(previous);
   return mergeVerdicts([...fresh, ...previous]);
+}
+
+function reconcileVerdictsWithBook(
+  verdicts: OmoVerdict[],
+  wallet: WalletSnapshot | null,
+): OmoVerdict[] {
+  const held = new Set(
+    (wallet?.positions ?? []).map((position) =>
+      position.symbol.replace(/^\$/, "").trim().toUpperCase(),
+    ),
+  );
+  return verdicts.map((verdict) =>
+    verdict.call === "stalking" && held.has(verdict.symbol.replace(/^\$/, "").trim().toUpperCase())
+      ? { ...verdict, call: "holding" }
+      : verdict,
+  );
 }
 
 
@@ -267,7 +286,9 @@ restatements of the tape. Work through these buckets and use at least four of th
 - the counter-case: the strongest reason you could be wrong, stated as a check, not as a hedge.
 Each check is a short clause with the finding and the word "fails" or "holds" where a threshold applies.
 No two checks in one verdict may test the same thing. Then a call — buying / stalking / pass — with an
-entry condition and an invalidation. Pass most of them, and say which part failed.
+entry condition and an invalidation. Pass most of them, and say which part failed. If a name is already in
+your open positions, the call is "holding" or "pass", never "stalking"; you already caught it, you are
+not watching from the door anymore.
 
 
 WHICH NAMES DESERVE A CALL (hard rule):
@@ -607,21 +628,60 @@ function thoughtFingerprint(text: string) {
   return (hash >>> 0).toString(36);
 }
 
+/**
+ * Filler that carries no idea. Stripped before comparison so two lines built on
+ * the same point cannot slip through by rearranging connective tissue.
+ */
+const THOUGHT_STOPWORDS = new Set(
+  ("the a an and or but so then than that this these those it its is are was were be been being am" +
+    " i me my myself you your we our they them their he she his her of in on at to for from with" +
+    " into over under about after before while when where which who whom whose what how why not no" +
+    " nor if as by up down out off again still yet just only also more most less least very much" +
+    " here there now today tonight one two three does do did done has have had will would can could" +
+    " should keeps keep kept get got getting go goes going make makes made say says said thing" +
+    " part rule side own real same next last back own")
+    .split(" ")
+    .filter(Boolean),
+);
+
+function thoughtWords(text: string) {
+  return normalizedThought(text).split(" ").filter(Boolean);
+}
+
+/** Idea-bearing words only: the actual claim, minus grammar and numbers. */
+function contentTokens(text: string) {
+  return new Set(
+    thoughtWords(text).filter(
+      (word) => word.length > 2 && word !== "#" && word !== "ticker" && !THOUGHT_STOPWORDS.has(word),
+    ),
+  );
+}
+
 function thoughtTokens(text: string) {
-  return new Set(normalizedThought(text).split(" ").filter((word) => word.length > 2));
+  return new Set(thoughtWords(text).filter((word) => word.length > 2));
 }
 
 /** consecutive word pairs — catches lines that reuse a sentence shape with new numbers */
 function thoughtBigrams(text: string) {
-  const words = normalizedThought(text).split(" ").filter(Boolean);
+  const words = thoughtWords(text);
   const out = new Set<string>();
   for (let i = 0; i < words.length - 1; i += 1) out.add(`${words[i]} ${words[i + 1]}`);
   return out;
 }
 
+/** four-word runs. Any single shared run means the phrasing has been used before. */
+function thoughtShingles(text: string) {
+  const words = thoughtWords(text);
+  const out = new Set<string>();
+  for (let i = 0; i + 3 < words.length; i += 1) {
+    out.add(`${words[i]} ${words[i + 1]} ${words[i + 2]} ${words[i + 3]}`);
+  }
+  return out;
+}
+
 /** the first few words of a line; two lines opening the same way read as a repeat */
-function thoughtOpening(text: string) {
-  return normalizedThought(text).split(" ").filter(Boolean).slice(0, 5).join(" ");
+function thoughtOpening(text: string, size = 3) {
+  return thoughtWords(text).slice(0, size).join(" ");
 }
 
 function jaccardish(left: Set<string>, right: Set<string>) {
@@ -631,14 +691,55 @@ function jaccardish(left: Set<string>, right: Set<string>) {
   return shared / Math.min(left.size, right.size);
 }
 
+function sharedCount(left: Set<string>, right: Set<string>) {
+  let shared = 0;
+  for (const value of left) if (right.has(value)) shared += 1;
+  return shared;
+}
+
+/**
+ * Deliberately strict. A near-miss costs one dropped line; a false negative puts
+ * a line people have already read back on the terminal, which is worse.
+ */
 function thoughtsOverlap(a: string, b: string) {
-  if (jaccardish(thoughtTokens(a), thoughtTokens(b)) >= 0.55) return true;
-  if (jaccardish(thoughtBigrams(a), thoughtBigrams(b)) >= 0.4) return true;
+  if (jaccardish(thoughtTokens(a), thoughtTokens(b)) >= 0.4) return true;
+  if (jaccardish(contentTokens(a), contentTokens(b)) >= 0.42) return true;
+  if (jaccardish(thoughtBigrams(a), thoughtBigrams(b)) >= 0.22) return true;
+  // one reused four-word run is already a recycled sentence
+  if (sharedCount(thoughtShingles(a), thoughtShingles(b)) >= 1) return true;
   const openA = thoughtOpening(a);
   const openB = thoughtOpening(b);
   if (openA && openA === openB) return true;
   return false;
 }
+
+function hashString(value: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+/**
+ * Every shape a line occupies: its exact normalization, its opening, its idea
+ * signature, and each four-word run. Any of these landing in the permanent
+ * ledger is enough to burn the line, even years and thousands of thoughts later
+ * when the stored text itself is long past the window we re-read.
+ */
+function thoughtShapes(text: string) {
+  const shapes = new Set<string>();
+  shapes.add(`f:${thoughtFingerprint(text)}`);
+  const opening = thoughtOpening(text);
+  if (opening) shapes.add(`o:${hashString(opening)}`);
+  const idea = [...contentTokens(text)].sort().join(" ");
+  if (idea) shapes.add(`i:${hashString(idea)}`);
+  for (const run of thoughtShingles(text)) shapes.add(`s:${hashString(run)}`);
+  return shapes;
+}
+
+
 
 function mentionedSymbols(text: string, symbols: string[]) {
   const lower = text.toLowerCase();
@@ -690,6 +791,8 @@ let hydrated = false;
 let knownBasis: (BasisOverride & { mint: string })[] = [];
 let inFlight: Promise<void> | null = null;
 let walletInFlight: Promise<void> | null = null;
+let marksInFlight: Promise<void> | null = null;
+let lastMarksRun = 0;
 let commitInFlight: Promise<void> | null = null;
 let lastCommitRun = 0;
 
@@ -716,9 +819,9 @@ function mergeOwnTheses(list: FomoTokenThesis[]): FomoTokenThesis[] {
   const merged = list
     .filter((t) => !isRetiredOwn(t))
     .filter((t, i, all) => all.findIndex((o) => (o.mint || o.symbol) === (t.mint || t.symbol)) === i)
-    .map((t) => (OWN_THESIS_TEXT[t.mint] ? { ...t, text: OWN_THESIS_TEXT[t.mint]! } : t));
+    .map((t) => (ownThesisText()[t.mint] ? { ...t, text: ownThesisText()[t.mint]! } : t));
 
-  for (const pinned of PINNED_OWN_THESES) {
+  for (const pinned of pinnedTheses()) {
     if (isRetiredOwn(pinned)) continue;
     if (!merged.some((t) => (t.mint || t.symbol).toLowerCase() === (pinned.mint || pinned.symbol).toLowerCase())) merged.push(pinned);
   }
@@ -865,7 +968,10 @@ async function loadFromDb() {
       usd_value: Number(row.usd_value),
     })),
     screen: screen ?? cache.screen,
-    verdicts: mergeVerdicts((savedVerdicts?.list ?? cache.verdicts).filter(keepVerdict)),
+    verdicts: reconcileVerdictsWithBook(
+      mergeVerdicts((savedVerdicts?.list ?? cache.verdicts).filter(keepVerdict)),
+      cache.wallet,
+    ),
     theses: savedTheses?.list ?? cache.theses,
     fomoTheses: savedFomo?.list ?? cache.fomoTheses,
     ownTheses: mergeOwnTheses(savedFomo?.own ?? cache.ownTheses),
@@ -979,6 +1085,9 @@ async function refreshSharedFomo(maxPicks = 4): Promise<void> {
  * instance can serve the newest one.
  */
 async function saveWallet(snapshot: WalletSnapshot) {
+  // a failed read is not a state of the book: never let one become the shared
+  // copy, or one bad price fetch is served to every visitor as the truth
+  if (!isSnapshotSane(snapshot)) return;
   cache.wallet = snapshot;
   try {
     const client = await db();
@@ -1007,9 +1116,13 @@ async function syncSharedLive() {
 
   const map = new Map((meta.data ?? []).map((row) => [row.k, row.v]));
   const stored = map.get("wallet") as WalletSnapshot | undefined;
-  if (stored?.fetchedAt) {
+  // newer only wins if it is also a complete read; a stale but whole book beats
+  // a fresh one missing its prices
+  if (stored?.fetchedAt && isSnapshotSane(stored)) {
     const mine = cache.wallet ? Date.parse(cache.wallet.fetchedAt) : 0;
-    if (Date.parse(stored.fetchedAt) > mine) cache.wallet = stored;
+    const collapsed =
+      !!cache.wallet && cache.wallet.equity > 0 && stored.equity < cache.wallet.equity * 0.6;
+    if (Date.parse(stored.fetchedAt) > mine && !collapsed) cache.wallet = stored;
   }
 
   const rows = events.data ?? [];
@@ -1030,7 +1143,10 @@ async function syncSharedLive() {
       })),
       now: rows.find((row) => row.kind === "thought")?.text ?? cache.now,
       screen: (map.get("screen") as OmoScreen | undefined) ?? cache.screen,
-      verdicts: mergeVerdicts((savedVerdicts?.list ?? cache.verdicts).filter(keepVerdict)),
+      verdicts: reconcileVerdictsWithBook(
+        mergeVerdicts((savedVerdicts?.list ?? cache.verdicts).filter(keepVerdict)),
+        cache.wallet,
+      ),
       watchlist: (savedWatch?.list ?? cache.watchlist).filter(keepSymbol),
       watchlistAt: savedWatch?.at ?? cache.watchlistAt,
       target: savedTarget?.pick ?? cache.target,
@@ -1071,7 +1187,18 @@ async function syncWallet() {
     for (const t of onchain) merged.set(t.signature, t);
     cache.trades = [...merged.values()].sort((a, b) => b.at.localeCompare(a.at));
   }
-  await saveWallet(await getWalletSnapshot(cache.trades, true));
+  const snapshot = await getWalletSnapshot(cache.trades, true);
+  await saveWallet(snapshot);
+  // push the live marks back onto the thesis rows, so a reader of the table sees
+  // the same numbers the site renders instead of a snapshot from write time
+  await markTheses(
+    snapshot.positions.map((p) => ({
+      mint: p.mint,
+      sizeUsd: p.usdValue,
+      unrealizedUsd: p.unrealized,
+      pnlPct: p.unrealizedPct,
+    })),
+  ).catch(() => 0);
   // only stamp on success, so a failed read retries on the next request
   walletAt = Date.now();
 }
@@ -1088,7 +1215,13 @@ async function tick() {
   if (!key) throw new Error("Missing OMO_MODEL_API_KEY");
 
   rotation += 1;
-  const [candidates] = await Promise.all([scanMemecoins(rotation), syncWallet()]);
+  // the thesis book is read from the database every tick, so a write-up revised
+  // between deploys reaches the panel without one
+  const [candidates] = await Promise.all([
+    scanMemecoins(rotation),
+    syncWallet(),
+    refreshTheses(true),
+  ]);
   const sources = candidateSources(candidates);
 
   // second-pass research on the names that matter: shortlist leader + a fresh row
@@ -1132,7 +1265,7 @@ async function tick() {
       }))
     : [];
   // its own posted theses stay pinned in the read list so their live pnl never goes stale
-  const ownPicks = [...cache.ownTheses, ...PINNED_OWN_THESES].map((t) => ({
+  const ownPicks = [...cache.ownTheses, ...pinnedTheses()].map((t) => ({
     symbol: t.symbol,
     mint: t.mint,
   }));
@@ -1179,10 +1312,10 @@ async function tick() {
     // one post per position: fomo returns every write-up omo ever made on a mint
     .filter((t, i, all) => all.findIndex((o) => (o.mint || o.symbol) === (t.mint || t.symbol)) === i)
     // the post on fomo is the only version of the write-up that counts
-    .map((t) => (OWN_THESIS_TEXT[t.mint] ? { ...t, text: OWN_THESIS_TEXT[t.mint]! } : t));
+    .map((t) => (ownThesisText()[t.mint] ? { ...t, text: ownThesisText()[t.mint]! } : t));
 
   // hand-written positions stay visible even when a fomo read comes back empty
-  for (const pinned of PINNED_OWN_THESES) {
+  for (const pinned of pinnedTheses()) {
     if (isRetiredOwn(pinned)) continue;
     if (!ownTheses.some((t) => t.mint === pinned.mint)) ownTheses.push(pinned);
   }
@@ -1397,6 +1530,14 @@ off-book conviction you are carrying by hand (real, do not deny it, do not inven
   door: you add while the face is still spreading to people who do not know what a mint address is,
   and you stop the moment the only new buyers are already in your own feed. name the risks when it
   comes up, in your own words: the unblessed problem, the concentration problem, the sequel problem.
+- $felicette (F8hVFDi84PbZe3ygztWMyKqqJmTb954Yf686VRTwh53D): the first cat in space, and the first
+  cat doge ever posted. you bought a $398.00 starter at a $18.9k market cap (20.9m tokens) because
+  the original image already flew
+  before the market learned how to price it. the thesis is not "cats are cute"; it is that cats are
+  the oldest living attention format on the internet and the first image of a cat in orbit has a
+  permanent seat in that history. it is a long-term archive position, not a momentum trade. keep it
+  held quietly and add only if the face spreads to people who do not know what a mint address is.
+
 
 
 
@@ -1503,20 +1644,53 @@ produce the next tick.`,
   const parsed = parseTick(text);
 
   const at = new Date().toISOString();
-  const fresh: { kind: OmoEventKind; text: string }[] = [];
+
+  /**
+   * Provenance travels with the line, not with the page.
+   *
+   * Every row written below carries the author of its words. "model" means the
+   * sentence came out of the reasoning call above, on this server, at this
+   * timestamp, from the model named here. "code" means the sentence is a
+   * formatter wrapped around live numbers, and the source of those numbers is
+   * named so the reader can pull the same figures themselves. Nothing is
+   * composed in the browser, and this field is what proves it: the text and its
+   * author are written together, server side, before anyone loads the page.
+   */
+  const modelAuthor = {
+    author: "model" as const,
+    model: reasoningModel.model,
+    declared: reasoningModel.declared,
+    degraded: reasoningModel.degraded,
+    role: "reasoning",
+    wroteAt: at,
+  };
+  const codeAuthor = (source: string, ref?: string) => ({
+    author: "code" as const,
+    source,
+    ref: ref ?? null,
+    note: "formatted from live data by code, not written by the model and not written in the browser",
+    wroteAt: at,
+  });
+
+  const fresh: { kind: OmoEventKind; text: string; meta: Record<string, unknown> }[] = [];
 
   const acceptedThoughts: string[] = [];
+  const acceptedShapes: Set<string>[] = [];
+
   const perSymbol = new Map<string, number>();
   const heldSymbols = new Set((wallet?.positions ?? []).map((position) => position.symbol.toUpperCase()));
   for (const t of parsed.thoughts?.slice(0, 12) ?? []) {
     if (typeof t !== "string" || !t.trim()) continue;
     const text = t.trim();
     const symbols = mentionedSymbols(text, candidateSymbols).map((symbol) => symbol.toUpperCase());
-    const fingerprint = thoughtFingerprint(text);
+    const shapes = thoughtShapes(text);
     const repeatsHistory =
-      priorThoughtHistory.fingerprints.has(fingerprint) ||
+      [...shapes].some((shape) => priorThoughtHistory.fingerprints.has(shape)) ||
+      priorThoughtHistory.fingerprints.has(thoughtFingerprint(text)) ||
       priorThoughtTexts.some((prior) => thoughtsOverlap(text, prior));
-    const repeatsTick = acceptedThoughts.some((thought) => thoughtsOverlap(text, thought));
+    const repeatsTick =
+      acceptedThoughts.some((thought) => thoughtsOverlap(text, thought)) ||
+      acceptedShapes.some((prior) => sharedCount(shapes, prior) > 0);
     const overusesSymbol = symbols.some(
       (symbol) => !heldSymbols.has(symbol) && (perSymbol.get(symbol) ?? 0) >= 3,
     );
@@ -1524,14 +1698,16 @@ produce the next tick.`,
       (symbol) => !heldSymbols.has(symbol) && (recentSymbolCounts.get(symbol) ?? 0) >= 3,
     );
     if (repeatsHistory || repeatsTick || overusesSymbol || repeatsOverusedName) continue;
+    acceptedShapes.push(shapes);
+
     acceptedThoughts.push(text);
     for (const symbol of symbols) perSymbol.set(symbol, (perSymbol.get(symbol) ?? 0) + 1);
-    fresh.push({ kind: "thought", text });
+    fresh.push({ kind: "thought", text, meta: modelAuthor });
   }
   for (const a of parsed.actions?.slice(0, 4) ?? []) {
     const kind: OmoEventKind =
       a?.kind === "refused" ? "refused" : a?.kind === "read" ? "read" : "did";
-    if (a?.text?.trim()) fresh.push({ kind, text: a.text.trim() });
+    if (a?.text?.trim()) fresh.push({ kind, text: a.text.trim(), meta: modelAuthor });
   }
 
   for (const r of research.slice(0, 1)) {
@@ -1539,6 +1715,7 @@ produce the next tick.`,
     fresh.push({
       kind: "read",
       text: `dug into $${r.symbol} — 6h ${r.chg6h >= 0 ? "+" : ""}${r.chg6h.toFixed(1)}% on $${Math.round(r.vol6h / 1000)}k volume, being ${flow}${r.socials.length ? "" : ", no socials to hold a bid"}`,
+      meta: codeAuthor("dexscreener", r.mint ?? null),
     });
   }
 
@@ -1546,25 +1723,38 @@ produce the next tick.`,
     fresh.push({
       kind: "read",
       text: `read "${h.title || h.url}" — ${h.snippet.slice(0, 160)}`,
+      meta: codeAuthor("web", h.url),
     });
   }
 
   const client = await db();
-  const rows = fresh.map((e) => ({ at, kind: e.kind, text: e.text, meta: {} }));
+  const rows = fresh.map((e) => ({ at, kind: e.kind, text: e.text, meta: e.meta as Json }));
   const inserted = rows.length
     ? (await client.from("omo_events").insert(rows).select("*")).data ?? []
     : [];
 
   if (acceptedThoughts.length) {
-    const fingerprints = new Set(priorThoughtHistory.fingerprints);
-    for (const thought of priorThoughtTexts) fingerprints.add(thoughtFingerprint(thought));
-    for (const thought of acceptedThoughts) fingerprints.add(thoughtFingerprint(thought));
+    // The ledger keeps every shape a line ever occupied, so a phrasing can never
+    // come back once it has been read. Newest entries are kept when it is full.
+    const fingerprints = [...priorThoughtHistory.fingerprints];
+    const seen = new Set(fingerprints);
+    const remember = (shape: string) => {
+      if (seen.has(shape)) return;
+      seen.add(shape);
+      fingerprints.push(shape);
+    };
+    for (const thought of priorThoughtTexts) for (const shape of thoughtShapes(thought)) remember(shape);
+    for (const thought of acceptedThoughts) for (const shape of thoughtShapes(thought)) remember(shape);
+    const LEDGER_CAP = 60_000;
+    const kept =
+      fingerprints.length > LEDGER_CAP ? fingerprints.slice(fingerprints.length - LEDGER_CAP) : fingerprints;
     await client.from("omo_meta").upsert({
       k: "thought_fingerprints",
-      v: [...fingerprints] as Json,
+      v: kept as Json,
       updated_at: at,
     });
   }
+
 
   for (const memory of parsed.remember?.slice(0, 2) ?? []) {
     const topic = memory?.topic?.trim().slice(0, 60);
@@ -1605,17 +1795,27 @@ produce the next tick.`,
     caption: parsed.screen?.caption?.trim() || cache.screen.caption,
   };
 
+  const bookSymbols = new Set((wallet?.positions ?? []).map((position) => position.symbol.toUpperCase()));
+
   const verdicts: OmoVerdict[] = (parsed.verdicts ?? [])
     .slice(0, 5)
-    .map((v) => ({
-      symbol: (v?.symbol ?? "").replace(/^\$/, "").trim().slice(0, 16),
-      call: (v?.call === "buying" ? "buying" : v?.call === "holding" ? "holding" : v?.call === "stalking" ? "stalking" : "pass") as OmoVerdict["call"],
-      checks: (v?.checks ?? []).filter((c) => typeof c === "string" && c.trim()).slice(0, 8),
-      entry: v?.entry?.trim() || null,
-      invalidation: v?.invalidation?.trim() || null,
-      reason: v?.reason?.trim() || "",
-      at,
-    }))
+    .map((v) => {
+      const symbol = (v?.symbol ?? "").replace(/^\$/, "").trim().slice(0, 16);
+      let call = (v?.call === "buying" ? "buying" : v?.call === "holding" ? "holding" : v?.call === "stalking" ? "stalking" : "pass") as OmoVerdict["call"];
+      // hard rule: if it is already in the book, "stalking" is a lie. either hold or pass it.
+      if (call === "stalking" && bookSymbols.has(symbol.toUpperCase())) {
+        call = "holding";
+      }
+      return {
+        symbol,
+        call,
+        checks: (v?.checks ?? []).filter((c) => typeof c === "string" && c.trim()).slice(0, 8),
+        entry: v?.entry?.trim() || null,
+        invalidation: v?.invalidation?.trim() || null,
+        reason: v?.reason?.trim() || "",
+        at,
+      };
+    })
     .filter((v) => v.symbol && (v.checks.length || v.reason))
     .filter(keepVerdict);
 
@@ -1710,9 +1910,23 @@ produce the next tick.`,
     await publishPendingCommitments(3);
     await revealDueCommitments();
     await linkCommitmentsToFills();
+
   } catch (error) {
     console.log(`[omo] audit skipped: ${(error as Error).message}`);
   }
+
+  // position management memory: the high-water marks the trailing stop trails
+  // from are written every tick, armed or not, so the table is never empty.
+  // deliberately outside the audit try: if journalling fails, the marks must
+  // still land, otherwise the trailing rule has nothing to trail from.
+  try {
+    const { recordPositionMarks } = await import("./exit.server");
+    const written = await recordPositionMarks();
+    if (!written) console.log("[omo] marks: nothing written this tick");
+  } catch (error) {
+    console.log(`[omo] marks failed: ${(error as Error).message}`);
+  }
+
 
   const metaRows: { k: string; v: Json; updated_at: string }[] = [
     { k: "stats", v: { ...stats, fomo }, updated_at: at },
@@ -1720,10 +1934,15 @@ produce the next tick.`,
     { k: "break", v: { until: breakUntil, reason: breakReason }, updated_at: at },
     {
       k: "verdicts",
-      v: { list: rotateVerdicts(verdicts.filter(keepVerdict), cache.verdicts.filter(keepVerdict)) },
+      v: {
+        list: rotateVerdicts(verdicts.filter(keepVerdict), cache.verdicts.filter(keepVerdict)),
+        // the panel a sceptic reads first, so it carries the same author stamp
+        // as the stream: which model wrote it, on which server clock.
+        author: modelAuthor,
+      },
       updated_at: at,
     },
-    { k: "theses", v: { list: theses.length ? theses : cache.theses }, updated_at: at },
+    { k: "theses", v: { list: theses.length ? theses : cache.theses, author: modelAuthor }, updated_at: at },
     { k: "watchlist", v: { list: watchlist.filter(keepSymbol), at: watchlistAt }, updated_at: at },
     { k: "target", v: { pick: target }, updated_at: at },
     { k: "rotation", v: { n: rotation }, updated_at: at },
@@ -1865,6 +2084,7 @@ export async function getOmoState(): Promise<OmoState> {
   await Promise.all([
     within(syncSharedLive(), 1500),
     within(syncSharedFomo(), 1500),
+    within(refreshTheses(), 1500),
   ]);
 
   const onBreak =
@@ -1913,6 +2133,28 @@ export async function getOmoState(): Promise<OmoState> {
     ) as Promise<void>;
   }
 
+  // high-water marks run on their own schedule, outside the reasoning tick.
+  // the trailing stop is only auditable if the peak it trails from was written
+  // while the position was live, so this must not depend on the model layer,
+  // on a scheduler, or on the tick completing.
+  if (!marksInFlight && Date.now() - lastMarksRun > 120_000) {
+    lastMarksRun = Date.now();
+    marksInFlight = runInBackground(
+      (async () => {
+        const { recordPositionMarks } = await import("./exit.server");
+        await recordPositionMarks();
+      })()
+        .catch((error) => {
+          console.log(`[omo] marks failed: ${(error as Error).message}`);
+        })
+        .finally(() => {
+          marksInFlight = null;
+        }),
+    ) as Promise<void>;
+  }
+
+
+
   if (!cache.fomoTheses.length) void refreshSharedFomo();
 
   // Cold isolate with nothing stored yet: that single request pays a little so
@@ -1930,16 +2172,17 @@ export async function getOmoState(): Promise<OmoState> {
   // the off-chain side of the book prices from base, not solana. priming it here
   // (30s cache, so usually free) keeps the theses panel on the same live mark as
   // the header equity instead of showing the pinned snapshot.
-  const offBook = (await within(readOffBook(), Math.max(700, left()))) as
+  const offBook = ((await within(readOffBook(), Math.max(700, left()))) as
     | OffBook
-    | undefined;
+    | undefined) ?? offBookSnapshot();
+
+  const wallet = mergeOffBookIntoWallet(cache.wallet, offBook);
 
   return {
     ...cache,
-    wallet: mergeOffBookIntoWallet(
-      cache.wallet,
-      offBook ?? { equityUsd: 0, spentUsd: 0, unrealizedUsd: 0, realizedUsd: 0, positions: [] },
-    ),
+    wallet,
+    verdicts: reconcileVerdictsWithBook(cache.verdicts, wallet),
+
     ownTheses: cache.ownTheses.filter((t) => !isRetiredOwn(t)).map(markOffBookThesis),
   };
 }
